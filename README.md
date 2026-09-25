@@ -194,4 +194,4 @@ Case có thể nhận 0 điểm nếu:
 - sai `case_id` hoặc output không thể chấm theo schema;
 - thiếu evidence bắt buộc;
 - evidence ref không tồn tại;
-- evidence thuộc team, run hoặc case khác.
+- evidence thuộc team, run hoặc case khác..
