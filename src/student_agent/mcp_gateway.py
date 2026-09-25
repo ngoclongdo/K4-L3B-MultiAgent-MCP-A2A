@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -23,7 +24,16 @@ class EvidenceGateway:
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
-        result = await self._session.call_tool(tool_name, arguments=payload)
+        result = None
+        for attempt in range(2):
+            try:
+                result = await self._session.call_tool(tool_name, arguments=payload)
+                break
+            except Exception:
+                if attempt == 1:
+                    raise
+                await asyncio.sleep(1.0)
+        assert result is not None
         if getattr(result, "is_error", None) or getattr(result, "isError", None):
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
