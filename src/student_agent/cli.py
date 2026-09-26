@@ -27,7 +27,7 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
-async def _run(root: Path) -> None:
+async def _run(root: Path, fresh: bool = False) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
@@ -35,29 +35,78 @@ async def _run(root: Path) -> None:
     trace_path = root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
+
+    if fresh:
+        for stale in output_root.glob("*.json"):
+            stale.unlink()
+        trace_path.unlink(missing_ok=True)
+
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    try:
+        import httpx2
+        async with httpx2.AsyncClient() as client:
+            resp = await client.post(
+                f"{settings.competition_api_url}/api/v2/runs",
+                headers={
+                    "Authorization": f"Bearer {settings.team_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"variant_id": "l3b"},
+                timeout=30.0,
             )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            if resp.status_code in (200, 201):
+                print(f"Competition run initialized: {resp.json().get('variant_id')}", flush=True)
+            else:
+                print(f"Competition run init response: {resp.status_code} {resp.text[:80]}", flush=True)
+    except Exception as exc:
+        print(f"Warning: Failed to init competition run ({exc})", flush=True)
+
+    retries: dict[str, int] = {}
+    total_cases = len(case_set.case_ids)
+    case_idx = 0
+
+    while case_idx < total_cases:
+        case_id = case_set.case_ids[case_idx]
+        target = output_root / f"{case_id}.json"
+        if target.exists():
+            case_idx += 1
+            continue
+
+        try:
+            async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
+                discovered_tools = await gateway.list_tools()
+                if not discovered_tools:
+                    raise RuntimeError("MCP Gateway returned no tools")
+
+                while case_idx < total_cases:
+                    case_id = case_set.case_ids[case_idx]
+                    target = output_root / f"{case_id}.json"
+                    if target.exists():
+                        case_idx += 1
+                        continue
+
+                    case = case_set.cases[case_id]
+                    print(f"[{case_idx + 1}/{total_cases}] Running {case_id}...", flush=True)
+                    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                    output = await solve_case(case, gateway, trace)
+                    contracts.validate_output(output, f"outputs/{case_id}.json")
+                    if output.get("case_id") != case_id:
+                        raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                    temporary = target.with_suffix(".json.tmp")
+                    temporary.write_text(
+                        json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                    )
+                    temporary.replace(target)
+                    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                    case_idx += 1
+        except Exception as exc:
+            r = retries.get(case_id, 0) + 1
+            retries[case_id] = r
+            print(f"Warning: Gateway error at {case_id} ({exc}), retry {r}/5 in 2s...", flush=True)
+            if r > 5:
+                raise
+            await asyncio.sleep(2.0)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -66,7 +115,9 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
     commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    run_cmd = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run_cmd.add_argument("--fresh", action="store_true", default=True, help="clean outputs and trace before running")
+    run_cmd.add_argument("--resume", dest="fresh", action="store_false", help="resume existing run without clearing")
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -86,7 +137,7 @@ def main() -> None:
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(_run(root, fresh=args.fresh))
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")

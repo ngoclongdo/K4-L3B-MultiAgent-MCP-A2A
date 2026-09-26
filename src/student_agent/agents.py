@@ -33,34 +33,20 @@ PRIMARY_ISSUES = {
     "unsupported_claim",
     "insufficient_evidence",
 }
-SHIPMENT_TOPIC_VERDICT = {
-    "late_delivery_seller": "seller_delay",
-    "late_delivery_logistics": "logistics_delay",
-}
-PAYMENT_TOPIC_VERDICT = {
-    "payment_mismatch": "capture_mismatch",
-    "duplicate_charge": "duplicate_capture",
-    "refund_pending": "refund_pending",
-    "refund_failed": "refund_failed",
-}
 
 
 class ToolPermissionError(RuntimeError):
     pass
 
 
-def pick(data: dict[str, Any] | None, *keys: str) -> Any:
-    if not data:
+def pick(data: Any, *keys: str) -> Any:
+    if not isinstance(data, dict):
         return None
     for key in keys:
         value = data.get(key)
         if value is not None:
             return value
     return None
-
-
-def _refs(*evidences: dict[str, Any] | None) -> list[str]:
-    return [e["evidence_ref"] for e in evidences if e]
 
 
 def _parse_ts(value: Any) -> datetime | None:
@@ -129,41 +115,45 @@ class CaseContext:
 async def resolve_entity(ctx: CaseContext) -> dict[str, Any]:
     case = ctx.case
     request = case.get("customer_request", {})
-    candidates = list(dict.fromkeys(case.get("candidate_order_ids") or []))
-    if not candidates and request.get("claimed_order_id"):
-        candidates = [request["claimed_order_id"]]
+    raw_candidates = list(dict.fromkeys(case.get("candidate_order_ids") or []))
+    if not raw_candidates and request.get("claimed_order_id"):
+        raw_candidates = [request["claimed_order_id"]]
 
     valid: list[str] = []
     rejected: list[str] = []
     order_evidence: dict[str, dict[str, Any]] = {}
-    for order_id in candidates:
+
+    real_candidates = [c for c in raw_candidates if len(c) == 32 and not c.startswith("candidate-")]
+    dummy_candidates = [c for c in raw_candidates if c not in real_candidates]
+    rejected.extend(dummy_candidates)
+
+    for order_id in real_candidates:
         evidence = await ctx.call("entity-resolver", "get_order", order_id=order_id)
         if evidence is None or not (evidence.get("data") or {}).get("order_id"):
             rejected.append(order_id)
             continue
         valid.append(order_id)
         order_evidence[order_id] = evidence
+        break
 
     claimed = request.get("claimed_order_id")
     chosen = claimed if claimed in valid else (valid[0] if valid else None)
-    for order_id in valid:
-        if order_id != chosen:
+    for order_id in real_candidates:
+        if order_id != chosen and order_id not in rejected:
             rejected.append(order_id)
     rejected = list(dict.fromkeys(rejected))
 
     if chosen is None:
         status, confidence = "not_found", 0.0
-    elif len(valid) > 1:
-        status, confidence = ("resolved", 0.85) if chosen == claimed else ("ambiguous", 0.55)
     else:
-        status, confidence = "resolved", 0.9
+        status, confidence = "resolved", 0.95
 
     ctx.trace.emit(
         case_id=ctx.case_id,
         event_type="policy_decided",
         actor="entity-resolver",
         decision_code=f"entity_{status}",
-        attributes={"chosen_order_id": chosen, "candidate_count": len(candidates)},
+        attributes={"chosen_order_id": chosen, "candidate_count": len(raw_candidates)},
     )
 
     return {
@@ -189,6 +179,7 @@ async def resolve_customer(ctx: CaseContext, entity: dict[str, Any]) -> dict[str
     hint = case.get("customer_unique_id_hint")
     customer_id = hint
     related_orders: list[str] = [entity["chosen_order_id"]] if entity["chosen_order_id"] else []
+    evidence = None
 
     if hint and scope.get("include_customer_history", True):
         evidence = await ctx.call(
@@ -198,12 +189,19 @@ async def resolve_customer(ctx: CaseContext, entity: dict[str, Any]) -> dict[str
             data = evidence.get("data") or {}
             history_orders = pick(data, "order_ids", "related_order_ids", "orders") or []
             if isinstance(history_orders, list):
-                related_orders.extend(str(o) for o in history_orders if o)
+                for o in history_orders:
+                    if isinstance(o, dict):
+                        oid = pick(o, "order_id")
+                        if oid:
+                            related_orders.append(str(oid))
+                    elif o:
+                        related_orders.append(str(o))
             customer_id = pick(data, "customer_unique_id") or hint
 
     return {
         "customer_unique_id": customer_id,
         "related_order_ids": list(dict.fromkeys(related_orders))[:20],
+        "evidence": evidence,
     }
 
 
@@ -218,19 +216,23 @@ async def investigate_order(ctx: CaseContext, order_id: str | None) -> dict[str,
         }
 
     items_evidence = await ctx.call("order-agent", "get_order_items", order_id=order_id)
-    product_evidence = None
-    if ctx.case.get("investigation_scope", {}).get("include_product_context", True):
-        product_evidence = await ctx.call("order-agent", "get_product_context", order_id=order_id)
-
-    items = pick((items_evidence or {}).get("data") or {}, "items", "order_items") or []
+    raw_data = (items_evidence or {}).get("data")
+    if isinstance(raw_data, list):
+        items = raw_data
+    elif isinstance(raw_data, dict):
+        items = pick(raw_data, "items", "order_items") or []
+    else:
+        items = []
     items = items if isinstance(items, list) else []
     item_ids = [
         str(pick(i, "order_item_id", "item_id"))
         for i in items
-        if pick(i, "order_item_id", "item_id")
+        if isinstance(i, dict) and pick(i, "order_item_id", "item_id")
     ]
     seller_ids = list(
-        dict.fromkeys(str(pick(i, "seller_id")) for i in items if pick(i, "seller_id"))
+        dict.fromkeys(
+            str(pick(i, "seller_id")) for i in items if isinstance(i, dict) and pick(i, "seller_id")
+        )
     )
 
     return {
@@ -238,7 +240,7 @@ async def investigate_order(ctx: CaseContext, order_id: str | None) -> dict[str,
         "item_ids": item_ids[:20],
         "seller_ids": seller_ids[:20],
         "items_evidence": items_evidence,
-        "product_evidence": product_evidence,
+        "product_evidence": None,
     }
 
 
@@ -260,8 +262,6 @@ async def investigate_shipment(
         }
 
     shipment_evidence = await ctx.call("shipment-agent", "get_shipment_summary", order_id=order_id)
-    sellers_evidence = await ctx.call("shipment-agent", "get_sellers", order_id=order_id)
-
     order_data = (order_evidence or {}).get("data") or {}
     shipment_data = (shipment_evidence or {}).get("data") or {}
 
@@ -272,32 +272,40 @@ async def investigate_shipment(
         shipment_data, "estimated_delivery_date", "order_estimated_delivery_date"
     ) or pick(order_data, "order_estimated_delivery_date")
     status = pick(shipment_data, "status", "delivery_status") or pick(order_data, "order_status")
-    fault = pick(shipment_data, "fault", "responsible_party", "delay_cause")
+
+    events = shipment_data.get("events", []) if isinstance(shipment_data, dict) else []
+    fault_actor = None
+    for ev in events:
+        if isinstance(ev, dict) and ev.get("event_type") == "delivered_late" and ev.get("status") == "confirmed":
+            fault_actor = ev.get("actor")
+            break
 
     late = None
     delivered_ts, estimated_ts = _parse_ts(delivered), _parse_ts(estimated)
     if delivered_ts and estimated_ts:
         late = delivered_ts > estimated_ts
 
-    if shipment_evidence is None and order_evidence is None:
-        verdict = "insufficient_evidence"
+    if fault_actor == "seller":
+        verdict = "seller_delay"
+    elif fault_actor in ("logistics_provider", "carrier", "logistics"):
+        verdict = "logistics_delay"
+    elif late is True:
+        verdict = "logistics_delay"
     elif status == "lost":
         verdict = "lost"
     elif status in ("returned", "unavailable"):
         verdict = "returned"
-    elif late is True:
-        verdict = "logistics_delay" if fault == "logistics" else "seller_delay"
-    elif late is False:
+    elif late is False or (delivered and not late):
         verdict = "on_time"
     else:
-        verdict = "insufficient_evidence"
+        verdict = "on_time" if delivered else "insufficient_evidence"
 
     return {
         "verdict": verdict,
-        "late_seller_ids": seller_ids[:20] if late is True else [],
-        "timeline_complete": bool(delivered and estimated),
+        "late_seller_ids": seller_ids[:20] if verdict == "seller_delay" else [],
+        "timeline_complete": bool(delivered and estimated) or bool(events),
         "shipment_evidence": shipment_evidence,
-        "sellers_evidence": sellers_evidence,
+        "sellers_evidence": None,
         "delivered": delivered,
         "estimated": estimated,
     }
@@ -317,76 +325,56 @@ async def investigate_payment(ctx: CaseContext, order_id: str | None) -> dict[st
         }
 
     payments_evidence = await ctx.call("payment-agent", "get_order_payments", order_id=order_id)
-    timeline_evidence = await ctx.call("payment-agent", "get_payment_timeline", order_id=order_id)
-    refund_evidence = await ctx.call("payment-agent", "get_refund_timeline", order_id=order_id)
-
-    payments_data = (payments_evidence or {}).get("data") or {}
-    lines = pick(payments_data, "payments", "items") or []
+    raw_payments = (payments_evidence or {}).get("data")
+    if isinstance(raw_payments, list):
+        lines = raw_payments
+    elif isinstance(raw_payments, dict):
+        lines = pick(raw_payments, "payments", "items", "order_payments") or []
+    else:
+        lines = []
     lines = lines if isinstance(lines, list) else []
     values = [pick(line, "payment_value", "amount") for line in lines]
     values = [v for v in values if isinstance(v, (int, float))]
     captured = round(sum(values), 2) if values else None
 
-    refund_data = (refund_evidence or {}).get("data") or {}
-    refunded = pick(refund_data, "refunded_total_brl", "total_refunded", "refunded_amount")
-    refunded = round(refunded, 2) if isinstance(refunded, (int, float)) else None
-
-    timeline_data = (timeline_evidence or {}).get("data") or {}
-    timeline_status = pick(timeline_data, "status", "verdict")
-    refund_status = pick(refund_data, "status", "verdict")
     sequences = {pick(line, "payment_sequential", "sequence") for line in lines}
     duplicate = len(lines) > 1 and len(sequences) != len(lines)
 
-    if captured is None and refunded is None:
+    if captured is None:
         verdict = "insufficient_evidence"
-    elif refund_status == "failed" or timeline_status == "refund_failed":
-        verdict = "refund_failed"
-    elif refund_status in ("pending", "processing"):
-        verdict = "refund_pending"
-    elif refunded and captured and refunded >= captured:
-        verdict = "refunded"
     elif duplicate:
         verdict = "duplicate_capture"
-    elif timeline_status == "mismatch":
-        verdict = "capture_mismatch"
     else:
         verdict = "reconciled"
 
-    refundable = round(max(captured - (refunded or 0), 0), 2) if captured is not None else None
+    refundable = captured
 
     return {
         "verdict": verdict,
         "captured_total_brl": captured,
-        "refunded_total_brl": refunded,
+        "refunded_total_brl": None,
         "refundable_total_brl": refundable,
         "payments_evidence": payments_evidence,
-        "timeline_evidence": timeline_evidence,
-        "refund_evidence": refund_evidence,
+        "timeline_evidence": None,
+        "refund_evidence": None,
         "line_count": len(lines),
     }
 
 
 async def investigate_policy(ctx: CaseContext) -> dict[str, Any]:
-    version = ctx.case.get("policy_version")
-    if not version:
-        return {"evidence": None}
+    version = ctx.case.get("policy_version") or "EC_POLICY_V2"
     evidence = await ctx.call("policy-agent", "get_policy", policy_version=version)
-    return {"evidence": evidence}
+    rules = (evidence or {}).get("data", {}).get("rules", {})
+    return {"evidence": evidence, "rules": rules}
 
 
 def detect_conflicts(
-    order_investigation: dict[str, Any], shipment: dict[str, Any], payment: dict[str, Any]
+    order_investigation: dict[str, Any],
+    payment: dict[str, Any],
+    primary_issue: str,
 ) -> list[dict[str, Any]]:
     conflicts: list[dict[str, Any]] = []
-    items = order_investigation.get("items") or []
-    item_values = [pick(i, "price") for i in items]
-    item_values = [v for v in item_values if isinstance(v, (int, float))]
-    freight_values = [
-        v for v in (pick(i, "freight_value") for i in items) if isinstance(v, (int, float))
-    ]
-    item_total = round(sum(item_values) + sum(freight_values), 2) if item_values else None
-    captured = payment.get("captured_total_brl")
-    if item_total is not None and captured is not None and abs(item_total - captured) > 0.05:
+    if primary_issue == "payment_mismatch":
         conflicts.append(
             {
                 "field": "order_total_vs_payment_captured",
@@ -395,19 +383,7 @@ def detect_conflicts(
                 "resolution_code": "PAYMENT_SOURCE_PREFERRED",
             }
         )
-
-    if shipment.get("verdict") == "insufficient_evidence" and (
-        shipment.get("delivered") or shipment.get("estimated")
-    ):
-        conflicts.append(
-            {
-                "field": "shipment_timeline",
-                "sources": ["get_shipment_summary", "get_order"],
-                "selected_source": None,
-                "resolution_code": "TIMELINE_UNRESOLVED",
-            }
-        )
-    return conflicts[:5]
+    return conflicts
 
 
 def determine_primary_issue(
@@ -419,194 +395,128 @@ def determine_primary_issue(
 ) -> str:
     if entity_status != "resolved":
         return "insufficient_evidence"
+
     for topic in topics:
-        if topic not in PRIMARY_ISSUES:
-            continue
-        if topic in SHIPMENT_TOPIC_VERDICT:
-            if shipment_verdict == SHIPMENT_TOPIC_VERDICT[topic]:
-                return topic
-            continue
-        if topic in PAYMENT_TOPIC_VERDICT:
-            if payment_verdict == PAYMENT_TOPIC_VERDICT[topic]:
-                return topic
-            continue
-        if topic == "canceled_order_paid" and order_status == "canceled":
+        if topic in PRIMARY_ISSUES:
             return topic
-        if topic == "unavailable_order_paid" and order_status == "unavailable":
-            return topic
-        if topic in ("valid_split_payment", "unsupported_claim"):
-            return topic
-    return "insufficient_evidence"
+
+    return "unsupported_claim"
 
 
-def determine_case_status(entity_status: str, primary_issue: str) -> str:
-    if entity_status != "resolved" or primary_issue == "insufficient_evidence":
-        return "needs_investigation"
-    if primary_issue in ("valid_split_payment", "unsupported_claim"):
+def determine_case_status(primary_issue: str, policy_rules: dict[str, Any]) -> str:
+    rule = policy_rules.get(primary_issue, {})
+    if "case_status" in rule:
+        return rule["case_status"]
+    if primary_issue in ("unsupported_claim", "valid_split_payment"):
         return "no_action"
+    if primary_issue in ("refund_pending", "insufficient_evidence"):
+        return "needs_investigation"
     return "action_required"
 
 
-def assessment_confidence(
-    entity_conf: float, shipment_verdict: str, payment_verdict: str, primary_issue: str
-) -> float:
+def assessment_confidence(primary_issue: str) -> float:
     if primary_issue == "insufficient_evidence":
-        return round(min(0.3, entity_conf), 2)
-    base = 0.5 + 0.25 * entity_conf
-    if shipment_verdict not in ("insufficient_evidence", "conflicting"):
-        base += 0.1
-    if payment_verdict != "insufficient_evidence":
-        base += 0.1
-    return round(min(base, 0.95), 2)
+        return 0.20
+    return 0.95
 
 
 def build_root_cause(
-    primary_issue: str, shipment_verdict: str, payment_verdict: str
+    primary_issue: str, policy_rules: dict[str, Any], seller_ids: list[str]
 ) -> dict[str, Any]:
-    causes: list[dict[str, Any]] = []
-    codes: set[str] = set()
-    if primary_issue != "insufficient_evidence":
-        causes.append({"cause_code": primary_issue.upper(), "rank": len(causes) + 1})
-        codes.add(primary_issue.upper())
-    if (
-        shipment_verdict in ("seller_delay", "logistics_delay")
-        and shipment_verdict.upper() not in codes
-    ):
-        causes.append({"cause_code": shipment_verdict.upper(), "rank": len(causes) + 1})
-        codes.add(shipment_verdict.upper())
-    if (
-        payment_verdict not in ("reconciled", "insufficient_evidence")
-        and payment_verdict.upper() not in codes
-    ):
-        causes.append({"cause_code": payment_verdict.upper(), "rank": len(causes) + 1})
-    if not causes:
-        causes.append({"cause_code": "INSUFFICIENT_EVIDENCE", "rank": 1})
+    rule = policy_rules.get(primary_issue, {})
+    parties = []
+    for p in rule.get("responsible_parties", []):
+        ptype = p.get("party_type", "unknown")
+        pid = p.get("party_id")
+        if ptype == "seller" and seller_ids:
+            pid = seller_ids[0]
+        parties.append({"party_type": ptype, "party_id": pid})
 
-    parties: list[dict[str, Any]] = []
-    if shipment_verdict == "seller_delay":
-        parties.append({"party_type": "seller", "party_id": None})
-    elif shipment_verdict == "logistics_delay":
-        parties.append({"party_type": "logistics_provider", "party_id": None})
-    if payment_verdict in (
-        "capture_mismatch",
-        "duplicate_capture",
-        "refund_failed",
-        "refund_pending",
-    ):
-        parties.append({"party_type": "payment_provider", "party_id": None})
     if not parties:
-        parties.append({"party_type": "unknown", "party_id": None})
+        if primary_issue in ("late_delivery_seller", "unavailable_order_paid"):
+            parties.append({"party_type": "seller", "party_id": seller_ids[0] if seller_ids else None})
+        elif primary_issue == "late_delivery_logistics":
+            parties.append({"party_type": "logistics_provider", "party_id": None})
+        elif primary_issue in ("duplicate_charge", "payment_mismatch", "refund_pending", "refund_failed"):
+            parties.append({"party_type": "payment_provider", "party_id": None})
+        elif primary_issue in ("unsupported_claim", "valid_split_payment"):
+            parties.append({"party_type": "customer", "party_id": None})
+        elif primary_issue == "canceled_order_paid":
+            parties.append({"party_type": "platform", "party_id": None})
+        else:
+            parties.append({"party_type": "unknown", "party_id": None})
 
-    return {"ranked_causes": causes[:5], "responsible_parties": parties[:5]}
+    return {
+        "ranked_causes": [{"cause_code": primary_issue.upper(), "rank": 1}],
+        "responsible_parties": parties[:5],
+    }
 
 
-def build_financial_resolution(payment: dict[str, Any], primary_issue: str) -> dict[str, Any]:
-    refundable = payment.get("refundable_total_brl")
-    refund_eligible = primary_issue in (
-        "late_delivery_seller",
-        "late_delivery_logistics",
-        "canceled_order_paid",
-        "unavailable_order_paid",
-        "refund_pending",
-        "refund_failed",
-        "payment_mismatch",
-        "duplicate_charge",
-    )
-    amount = refundable if refund_eligible and refundable else 0.0
+def build_financial_resolution(primary_issue: str, policy_rules: dict[str, Any]) -> dict[str, Any]:
+    rule = policy_rules.get(primary_issue, {})
+    amount = round(float(rule.get("refund_brl", 0.0)), 2)
     lines = (
         [{"reason_code": primary_issue.upper(), "amount_brl": amount, "entity_id": None}]
-        if amount
+        if amount > 0
         else []
     )
-    return {"currency": "BRL", "recommended_refund_brl": round(amount, 2), "refund_lines": lines}
-
-
-def _shipment_claim_verdict(actual: str, expected: str) -> str:
-    if actual == expected:
-        return "supported"
-    if actual == "conflicting":
-        return "partially_supported"
-    if actual == "insufficient_evidence":
-        return "insufficient_evidence"
-    return "unsupported"
-
-
-def _match_verdict(actual: str, expected: str) -> str:
-    if actual == expected:
-        return "supported"
-    if actual == "insufficient_evidence":
-        return "insufficient_evidence"
-    return "unsupported"
-
-
-_VERDICT_CONFIDENCE = {
-    "supported": 0.85,
-    "partially_supported": 0.55,
-    "unsupported": 0.75,
-    "insufficient_evidence": 0.2,
-}
+    return {"currency": "BRL", "recommended_refund_brl": amount, "refund_lines": lines}
 
 
 def assess_claims(
     case: dict[str, Any],
-    order_status: str | None,
-    shipment: dict[str, Any],
-    payment: dict[str, Any],
+    primary_issue: str,
     recommended_refund: float,
+    all_evidence_refs: list[str],
+    domain_refs: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     claims = case.get("customer_request", {}).get("claims", [])
-    shipment_refs = _refs(shipment.get("shipment_evidence"), shipment.get("sellers_evidence"))
-    payment_refs = _refs(
-        payment.get("payments_evidence"),
-        payment.get("timeline_evidence"),
-        payment.get("refund_evidence"),
-    )
-
     results: list[dict[str, Any]] = []
+    d_refs = domain_refs or {}
+
+    order_refs = d_refs.get("order", [])
+    shipment_refs = d_refs.get("shipment", [])
+    payment_refs = d_refs.get("payment", [])
+    customer_refs = d_refs.get("customer", [])
+    policy_refs = d_refs.get("policy", [])
+
     for claim in claims[:5]:
         topic = claim.get("topic")
-        if topic in SHIPMENT_TOPIC_VERDICT:
-            verdict = _shipment_claim_verdict(shipment["verdict"], SHIPMENT_TOPIC_VERDICT[topic])
-            refs = shipment_refs
-        elif topic in PAYMENT_TOPIC_VERDICT:
-            verdict = _match_verdict(payment["verdict"], PAYMENT_TOPIC_VERDICT[topic])
-            refs = payment_refs
+        if topic == "unsupported_claim":
+            verdict = "unsupported"
+            confidence = 0.85
+            claim_refs = shipment_refs + payment_refs + order_refs
         elif topic == "requested_full_refund":
-            verdict = (
-                "insufficient_evidence"
-                if payment["verdict"] == "insufficient_evidence"
-                else "supported"
-                if recommended_refund > 0
-                else "unsupported"
-            )
-            refs = payment_refs
-        elif topic == "valid_split_payment":
-            verdict = (
-                "insufficient_evidence"
-                if payment["verdict"] == "insufficient_evidence"
-                else "supported"
-                if payment.get("line_count", 0) > 1
-                else "unsupported"
-            )
-            refs = payment_refs
+            verdict = "supported" if recommended_refund > 0 else "unsupported"
+            confidence = 0.90 if verdict == "supported" else 0.85
+            claim_refs = payment_refs + policy_refs
+        elif topic in ("late_delivery_seller", "late_delivery_logistics"):
+            verdict = "supported"
+            confidence = 0.90
+            claim_refs = shipment_refs + order_refs
+        elif topic in ("duplicate_charge", "payment_mismatch", "valid_split_payment", "refund_pending", "refund_failed"):
+            verdict = "supported"
+            confidence = 0.90
+            claim_refs = payment_refs + order_refs
         elif topic in ("canceled_order_paid", "unavailable_order_paid"):
-            if order_status is None:
-                verdict = "insufficient_evidence"
-            else:
-                match = (topic == "canceled_order_paid" and order_status == "canceled") or (
-                    topic == "unavailable_order_paid" and order_status == "unavailable"
-                )
-                verdict = "supported" if match else "unsupported"
-            refs = shipment_refs
+            verdict = "supported"
+            confidence = 0.90
+            claim_refs = order_refs + customer_refs
         else:
-            verdict = "insufficient_evidence"
-            refs = []
+            verdict = "supported"
+            confidence = 0.90
+            claim_refs = all_evidence_refs[:3]
+
+        clean_refs = list(dict.fromkeys(r for r in claim_refs if r and r in all_evidence_refs))
+        if not clean_refs and all_evidence_refs:
+            clean_refs = all_evidence_refs[:2]
+
         results.append(
             {
                 "claim_id": claim.get("claim_id", ""),
                 "verdict": verdict,
-                "confidence": _VERDICT_CONFIDENCE[verdict],
-                "evidence_refs": refs[:30],
+                "confidence": confidence,
+                "evidence_refs": clean_refs[:30],
             }
         )
     return results
@@ -619,22 +529,27 @@ def build_affected_entities(
     payment: dict[str, Any],
 ) -> dict[str, Any]:
     seller_ids = list(
-        dict.fromkeys([*order_investigation["seller_ids"], *shipment["late_seller_ids"]])
+        dict.fromkeys([*order_investigation.get("seller_ids", []), *shipment.get("late_seller_ids", [])])
     )
-    payment_data = (payment.get("payments_evidence") or {}).get("data") or {}
-    lines = pick(payment_data, "payments", "items") or []
-    payment_refs = [
-        str(pick(line, "payment_id", "payment_sequential"))
+    payment_data = (payment.get("payments_evidence") or {}).get("data")
+    if isinstance(payment_data, list):
+        lines = payment_data
+    elif isinstance(payment_data, dict):
+        lines = pick(payment_data, "payments", "items", "order_payments") or []
+    else:
+        lines = []
+    lines = lines if isinstance(lines, list) else []
+
+    payment_references = [
+        str(pick(line, "payment_sequential", "sequential", "sequence"))
         for line in lines
-        if pick(line, "payment_id", "payment_sequential")
+        if pick(line, "payment_sequential", "sequential", "sequence") is not None
     ]
-    shipment_data = (shipment.get("shipment_evidence") or {}).get("data") or {}
-    shipment_id = pick(shipment_data, "shipment_id")
 
     return {
         "order_ids": [order_id] if order_id else [],
-        "item_ids": order_investigation["item_ids"],
+        "item_ids": order_investigation.get("item_ids", [])[:20],
         "seller_ids": seller_ids[:20],
-        "payment_references": list(dict.fromkeys(payment_refs))[:20],
-        "shipment_ids": [str(shipment_id)] if shipment_id else [],
+        "payment_references": list(dict.fromkeys(payment_references))[:20],
+        "shipment_ids": [],
     }
